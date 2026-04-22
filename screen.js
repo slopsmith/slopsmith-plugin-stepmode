@@ -206,22 +206,39 @@
 
     // ── Toggle button ────────────────────────────────────────────────────
 
+    function configureButton(el) {
+        // Re-applied even on already-injected buttons — a player DOM
+        // rewrite via innerHTML would keep the element in the DOM but
+        // drop its onclick / class / text, leaving Step Mode
+        // un-toggleable. updateButton() overwrites class/text based on
+        // the current `enabled` state after this runs.
+        el.id = 'btn-stepmode';
+        el.textContent = 'Step';
+        el.title = 'Step Mode — pause at each note until played';
+        el.onclick = toggleEnabled;
+    }
+
     function ensureButton() {
-        // Re-inject if the button is missing (or was never injected — the
-        // #player-controls div exists in the initial DOM so this succeeds at
-        // load time, but re-injection keeps us resilient to player-DOM
-        // rewrites).
-        if (btn && document.body.contains(btn)) return;
+        // Re-inject if the button is missing. If a button with our id
+        // already exists (typical after a player-DOM rewrite), re-bind
+        // its handlers and re-paint state rather than trusting what's
+        // there.
+        if (btn && document.body.contains(btn)) {
+            configureButton(btn);
+            updateButton();
+            return;
+        }
         const existing = document.getElementById('btn-stepmode');
-        if (existing) { btn = existing; return; }
+        if (existing) {
+            btn = existing;
+            configureButton(btn);
+            updateButton();
+            return;
+        }
         const controls = document.getElementById('player-controls');
         if (!controls) return;
         btn = document.createElement('button');
-        btn.id = 'btn-stepmode';
-        btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
-        btn.textContent = 'Step';
-        btn.title = 'Step Mode — pause at each note until played';
-        btn.onclick = toggleEnabled;
+        configureButton(btn);
         // Insert before the last-child (typically the Close button) so new
         // buttons stack consistently with notedetect's Detect + gear.
         const closeBtn = controls.querySelector('button:last-child');
@@ -413,6 +430,13 @@
     }
 
     function onArrangementChanged() {
+        // Skip all work when Step Mode is off. enable() will rebuild
+        // the chart the moment the user toggles on, and no watch is
+        // running to need fresh data in the meantime. Avoids paying
+        // the chart-events rebuild cost on every arrangement /
+        // song-change notification for users who aren't running
+        // Step Mode.
+        if (!enabled) return;
         // Chart changed; re-scan (rebuildChartEvents resets the cursor
         // to 0 and swaps chartEvents for the new arrangement). If we
         // were paused on an event, the stale waitingFor belongs to the
