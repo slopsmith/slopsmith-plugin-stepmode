@@ -234,11 +234,10 @@
         const tick = () => {
             if (!enabled || state === STATE_IDLE) { rafHandle = null; return; }
             if (state === STATE_PAUSED) {
-                // Holding — keep the RAF ticking so we can transition out of
-                // PAUSED via `advance()` + restart the watch. (We could stop
-                // the RAF here and restart on advance; the current shape is
-                // simpler and the per-frame cost of the early-return is nil.)
-                rafHandle = requestAnimationFrame(tick);
+                // Shouldn't reach here — pauseOn cancels the RAF. Defensive
+                // stop if something transitioned to PAUSED without going
+                // through pauseOn.
+                rafHandle = null;
                 return;
             }
             if (audio.paused) {
@@ -252,6 +251,7 @@
             const next = findNextEvent(t);
             if (next && t >= next.t - PAUSE_LOOKAHEAD_SEC) {
                 pauseOn(next);
+                return; // pauseOn cancels the RAF; don't schedule another tick
             }
             rafHandle = requestAnimationFrame(tick);
         };
@@ -274,6 +274,12 @@
         state = STATE_PAUSED;
         waitingFor = event;
         showWaitingHUD(event);
+        // Stop the RAF while paused — PAUSED can last indefinitely
+        // (user thinking, walking away, etc.) and we don't want to
+        // spin the main thread at 60 Hz just to early-return. advance()
+        // / onSeeked / onArrangementChanged restart the watch via
+        // startWatch() when transitioning back to WATCHING.
+        stopWatch();
     }
 
     function advance() {
@@ -293,6 +299,10 @@
             state = STATE_WATCHING;
             waitingFor = null;
             hideWaitingHUD();
+            // Restart the RAF — pauseOn cancelled it when we entered
+            // PAUSED, and we need it running again to watch for the
+            // next chart event.
+            startWatch();
         }
 
         // Only transition out of PAUSED after audio.play() actually
@@ -368,18 +378,37 @@
 
     function onArrangementChanged() {
         // Chart changed; re-scan (rebuildChartEvents resets the cursor).
-        // If we were paused on an event that no longer exists, we also
-        // need to resume the <audio> element — otherwise we'd leave
-        // playback paused with the HUD hidden and no way for the user
-        // to tell why audio stopped.
+        // If we were paused on an event that no longer exists in the
+        // new arrangement, we need to resume the <audio> element too —
+        // otherwise we'd leave playback paused with the HUD hidden and
+        // no obvious way forward. Only flip state/UI after play()
+        // actually resolves; on reject, stay paused and re-show the
+        // HUD so the user sees why nothing is advancing.
         rebuildChartEvents();
-        if (state === STATE_PAUSED) {
-            hideWaitingHUD();
-            waitingFor = null;
-            state = STATE_WATCHING;
-            const audio = getAudio();
-            if (audio) audio.play().catch(() => {});
+        if (state !== STATE_PAUSED) return;
+        const audio = getAudio();
+        if (!audio) return;
+        const staleEvent = waitingFor;
+        const playResult = audio.play();
+        if (playResult && typeof playResult.then === 'function') {
+            playResult.then(() => {
+                hideWaitingHUD();
+                waitingFor = null;
+                state = STATE_WATCHING;
+                startWatch();
+            }).catch(() => {
+                // play() rejected — leave state PAUSED and restore
+                // the HUD against the stale event so the user has
+                // something visible; a Space press or a hit for any
+                // note in the new arrangement will re-arm things.
+                showWaitingHUD(staleEvent);
+            });
+            return;
         }
+        hideWaitingHUD();
+        waitingFor = null;
+        state = STATE_WATCHING;
+        startWatch();
     }
 
     // ── Enable / disable ────────────────────────────────────────────────
