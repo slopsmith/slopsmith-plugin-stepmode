@@ -377,36 +377,44 @@
     }
 
     function onArrangementChanged() {
-        // Chart changed; re-scan (rebuildChartEvents resets the cursor).
-        // If we were paused on an event that no longer exists in the
-        // new arrangement, we need to resume the <audio> element too —
-        // otherwise we'd leave playback paused with the HUD hidden and
-        // no obvious way forward. Only flip state/UI after play()
-        // actually resolves; on reject, stay paused and re-show the
-        // HUD so the user sees why nothing is advancing.
+        // Chart changed; re-scan (rebuildChartEvents resets the cursor
+        // to 0 and swaps chartEvents for the new arrangement). If we
+        // were paused on an event, the stale waitingFor belongs to the
+        // old chart — dropping it here is important so notedetect hit
+        // matching doesn't try to compare new-arrangement hits against
+        // old-arrangement string/fret/time. Transition plan:
+        //   1. Drop the stale waitingFor up-front.
+        //   2. Try to resume audio. If it plays, we're back in WATCHING
+        //      and startWatch will find the next event for the new
+        //      chart.
+        //   3. If play() rejects, find the next event in the NEW chart
+        //      at the current audio.currentTime and pauseOn it — the
+        //      HUD shows the correct expected note for the new
+        //      arrangement, and notedetect hits will match against a
+        //      valid current target.
         rebuildChartEvents();
         if (state !== STATE_PAUSED) return;
         const audio = getAudio();
         if (!audio) return;
-        const staleEvent = waitingFor;
+        waitingFor = null;
+        hideWaitingHUD();
         const playResult = audio.play();
         if (playResult && typeof playResult.then === 'function') {
             playResult.then(() => {
-                hideWaitingHUD();
-                waitingFor = null;
                 state = STATE_WATCHING;
                 startWatch();
             }).catch(() => {
-                // play() rejected — leave state PAUSED and restore
-                // the HUD against the stale event so the user has
-                // something visible; a Space press or a hit for any
-                // note in the new arrangement will re-arm things.
-                showWaitingHUD(staleEvent);
+                const t = audio.currentTime;
+                const nextEvent = findNextEvent(t);
+                if (nextEvent) {
+                    pauseOn(nextEvent); // set state=PAUSED, show HUD, stop watch
+                } else {
+                    // No more events in the chart (e.g., seeked past end).
+                    state = STATE_WATCHING;
+                }
             });
             return;
         }
-        hideWaitingHUD();
-        waitingFor = null;
         state = STATE_WATCHING;
         startWatch();
     }
