@@ -278,21 +278,43 @@
 
     function advance() {
         const audio = getAudio();
-        if (!audio) return;
-        // Bump the cursor past the event we just advanced off, so the
-        // next RAF tick looks for the FOLLOWING event rather than
-        // re-pausing on this one. Invariant: at entry, waitingFor ===
-        // chartEvents[nextEventIdx] (because `pauseOn` only fires for
-        // events returned by `findNextEvent`).
-        if (waitingFor && chartEvents[nextEventIdx] === waitingFor) {
-            nextEventIdx++;
+        const waitedEvent = waitingFor;
+        if (!audio || !waitedEvent) return;
+
+        function completeAdvance() {
+            // Bump the cursor past the event we just advanced off, so the
+            // next RAF tick looks for the FOLLOWING event rather than
+            // re-pausing on this one. Invariant: at entry, waitingFor
+            // was === chartEvents[nextEventIdx] (pauseOn only fires for
+            // events returned by findNextEvent).
+            if (chartEvents[nextEventIdx] === waitedEvent) {
+                nextEventIdx++;
+            }
+            state = STATE_WATCHING;
+            waitingFor = null;
+            hideWaitingHUD();
         }
-        state = STATE_WATCHING;
-        waitingFor = null;
-        hideWaitingHUD();
-        // playbackRate survives across pause/play, so the user's speed-slider
-        // setting (0.5×, 1×, etc.) is preserved without us touching it.
-        audio.play().catch(() => { /* autoplay-policy or user cancelled */ });
+
+        // Only transition out of PAUSED after audio.play() actually
+        // resolves. If the browser rejects the resume (autoplay-policy
+        // edge cases, gesture-gating on non-user-initiated resume
+        // paths), we'd otherwise land in WATCHING with audio paused
+        // and the HUD hidden — visibly stuck with no way forward.
+        // On reject: stay paused, keep the HUD visible, user can
+        // retry via Space or another hit. playbackRate survives
+        // across pause/play so the speed-slider setting is preserved.
+        const playResult = audio.play();
+        if (playResult && typeof playResult.then === 'function') {
+            playResult.then(completeAdvance).catch(() => {
+                state = STATE_PAUSED;
+                waitingFor = waitedEvent;
+                showWaitingHUD(waitedEvent);
+            });
+            return;
+        }
+        // Older browsers may return undefined from play(); treat as
+        // a synchronous success.
+        completeAdvance();
     }
 
     // ── Event handlers ───────────────────────────────────────────────────
@@ -405,15 +427,30 @@
             return;
         }
         if (orig._stepmodeWrapped) return;
-        const wrapper = async function (...args) {
-            const ret = await orig.apply(this, args);
+        // Preserve the original return type — slopsmith core's
+        // playSong is async today, but wrapping it in `async function`
+        // unconditionally would force every future sync version to
+        // become a Promise too. Chain on the return value only if
+        // it's actually a Promise; otherwise run post-load logic
+        // synchronously and return the original value unchanged.
+        const wrapper = function (...args) {
+            const ret = orig.apply(this, args);
             // After a song loads: make sure our button is still in the
             // player-controls row (in case slopsmith rebuilt it), and
             // re-scan the chart. Step-mode's enabled flag persists
             // across songs on purpose — if a user had it on for song
             // A and loads song B, they keep it on for B.
-            ensureButton();
-            onArrangementChanged();
+            const afterLoad = () => {
+                ensureButton();
+                onArrangementChanged();
+            };
+            if (ret && typeof ret.then === 'function') {
+                return ret.then(value => {
+                    afterLoad();
+                    return value;
+                });
+            }
+            afterLoad();
             return ret;
         };
         wrapper._stepmodeWrapped = true;
