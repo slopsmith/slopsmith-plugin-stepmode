@@ -1,0 +1,7 @@
+{
+  "id": "step_mode",
+  "name": "Step Mode",
+  "version": "0.1.0",
+  "private": false,
+  "script": "screen.js"
+}
