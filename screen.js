@@ -50,6 +50,18 @@
     // make the stop feel sluggish.
     const PAUSE_LOOKAHEAD_SEC = 0.05;
 
+    // How far past a chart event's time we still treat it as "current"
+    // rather than "definitively missed". A RAF hitch (GC, background
+    // tab, heavy chart render on neighbour plugins) can jump
+    // audio.currentTime 200–500 ms between ticks; without this
+    // catch-up window, the cursor-walk in findNextEvent would skip
+    // silently past any event whose pause-window was entirely straddled
+    // by the hitch, and Step Mode would never pause for that note.
+    // 0.5 s is comfortably above typical hitches while staying well
+    // under seek granularity — seek jumps are handled separately by
+    // onSeeked + resetCursor.
+    const EVENT_MISSED_SEC = 0.5;
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     function getAudio() { return document.getElementById('audio'); }
@@ -123,10 +135,14 @@
         // re-trigger on the same event — an infinite loop where
         // step-mode never progresses past the first note.
         //
-        // On seek / rebuild / arrangement change, callers reset
-        // nextEventIdx to 0 and this scan advances it forward. Backward
-        // seeks are handled the same way — reset first, re-scan.
-        while (nextEventIdx < chartEvents.length && chartEvents[nextEventIdx].t < t) {
+        // The skip threshold is `t - EVENT_MISSED_SEC`, not `t`, so a
+        // RAF hitch that jumps audio past an event's pause window
+        // doesn't silently lose the event — the next tick still sees
+        // the event and pauses on it. Seeks are handled separately by
+        // `onSeeked` / `resetCursor`, so this tolerance window doesn't
+        // need to cover user-initiated jumps.
+        const skipThreshold = t - EVENT_MISSED_SEC;
+        while (nextEventIdx < chartEvents.length && chartEvents[nextEventIdx].t < skipThreshold) {
             nextEventIdx++;
         }
         return nextEventIdx < chartEvents.length ? chartEvents[nextEventIdx] : null;
