@@ -472,12 +472,14 @@
         // song-change notification for users who aren't running
         // Step Mode.
         if (!enabled) return;
-        // Chart changed; re-scan (rebuildChartEvents resets the cursor
-        // to 0 and swaps chartEvents for the new arrangement). If we
-        // were paused on an event, the stale waitingFor belongs to the
-        // old chart — dropping it here is important so notedetect hit
-        // matching doesn't try to compare new-arrangement hits against
-        // old-arrangement string/fret/time. Transition plan:
+        // Chart changed; re-scan (rebuildChartEvents swaps chartEvents
+        // for the new arrangement and realigns the cursor to the
+        // current audio.currentTime via resetCursor's binary search).
+        // If we were paused on an event, the stale waitingFor belongs
+        // to the old chart — dropping it here is important so
+        // notedetect hit matching doesn't try to compare new-
+        // arrangement hits against old-arrangement string/fret/time.
+        // Transition plan:
         //   1. Drop the stale waitingFor up-front.
         //   2. Try to resume audio. If it plays, we're back in WATCHING
         //      and startWatch will find the next event for the new
