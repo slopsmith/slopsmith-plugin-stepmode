@@ -79,10 +79,27 @@
         events.sort((a, b) => a.t - b.t);
         chartEvents = events;
         chartCacheKey = `${notes.length}-${chords.length}`;
-        // Reset the cursor — `findNextEvent` will scan forward from 0 on
-        // the next tick and land on the right place for the current
-        // audio.currentTime.
-        nextEventIdx = 0;
+        // Reset the cursor to the right starting point for the current
+        // audio time. Linear-from-0 would be O(n) on large charts
+        // (1000+ events in a long solo) every time the chart rebuilds.
+        resetCursor();
+    }
+
+    function resetCursor() {
+        // Binary-search for the first event with .t >= current audio
+        // time. Called on chart rebuilds, seeks, and song changes — any
+        // path where the cursor position is no longer meaningful.
+        // O(log n) vs. the linear scan that would otherwise fire on the
+        // next findNextEvent call with nextEventIdx=0.
+        const audio = getAudio();
+        const t = audio ? audio.currentTime : 0;
+        let lo = 0, hi = chartEvents.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (chartEvents[mid].t < t) lo = mid + 1;
+            else hi = mid;
+        }
+        nextEventIdx = lo;
     }
 
     function rebuildIfChartChanged() {
@@ -241,9 +258,14 @@
                 return;
             }
             if (audio.paused) {
-                // User manually paused outside step-mode — let them; we'll
-                // pick up on the next note once they resume.
-                rafHandle = requestAnimationFrame(tick);
+                // User manually paused outside step-mode (or we're before
+                // playback starts). `currentTime` isn't moving, so
+                // there's nothing for us to scan for. Stop the RAF and
+                // wait for the audio element's `play` event to restart
+                // via `onAudioPlay`. `{ once: true }` avoids listener
+                // accumulation if we bounce in/out of paused state.
+                rafHandle = null;
+                audio.addEventListener('play', onAudioPlay, { once: true });
                 return;
             }
             const t = audio.currentTime;
@@ -256,6 +278,14 @@
             rafHandle = requestAnimationFrame(tick);
         };
         rafHandle = requestAnimationFrame(tick);
+    }
+
+    function onAudioPlay() {
+        // Audio resumed after a user-initiated pause (not a step-mode
+        // PAUSED — that's handled by advance()/onArrangementChanged).
+        // Restart the watch if we're still supposed to be scanning.
+        if (!enabled || state !== STATE_WATCHING) return;
+        startWatch();
     }
 
     function stopWatch() {
@@ -333,6 +363,11 @@
         if (!enabled || state !== STATE_PAUSED || !waitingFor) return;
         const hit = e.detail;
         if (!hit || !hit.note) return;
+        // Require a real timestamp — older/partial notedetect:hit
+        // payloads that lack noteTime would otherwise coerce to 0 via
+        // `||` and spuriously match early-song notes where
+        // waitingFor.t < 0.5 on string/fret alone.
+        if (!Number.isFinite(hit.noteTime)) return;
         // Chord rule for v1: any matching string/fret within the waited
         // chord counts as advance. MikeShiner's preference (#52 thread)
         // over "all notes required", to keep the UX forgiving.
@@ -343,7 +378,7 @@
         // against a nearby chart note (common when playing fast
         // passages) shouldn't advance the wrong event. 0.5 s window
         // comfortably covers notedetect's default timing tolerance.
-        const timeOK = Math.abs((hit.noteTime || 0) - waitingFor.t) < 0.5;
+        const timeOK = Math.abs(hit.noteTime - waitingFor.t) < 0.5;
         if (match && timeOK) advance();
     }
 
@@ -365,9 +400,10 @@
     function onSeeked() {
         if (!enabled) return;
         // User seeked — the event they were waiting for may now be in
-        // the past or irrelevant. Reset the cursor so the next tick
-        // lands on the correct next event for the new `audio.currentTime`.
-        nextEventIdx = 0;
+        // the past or irrelevant. Jump the cursor directly to the new
+        // audio.currentTime via binary search rather than linear-scan
+        // from 0.
+        resetCursor();
         if (state === STATE_PAUSED) {
             hideWaitingHUD();
             waitingFor = null;
