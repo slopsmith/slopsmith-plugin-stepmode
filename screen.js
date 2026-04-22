@@ -43,6 +43,7 @@
     let waitingFor = null;     // current event (when PAUSED). Always === chartEvents[nextEventIdx] while paused.
     let btn = null;            // toggle button element
     let hudEl = null;          // waiting overlay
+    let audioPlayListenerPending = false; // guard against duplicate one-shot `play` listeners
 
     // Pause 50 ms BEFORE the chart note so the user never hears the note's
     // attack clipped. Smaller values risk audible truncation; larger values
@@ -279,10 +280,16 @@
                 // playback starts). `currentTime` isn't moving, so
                 // there's nothing for us to scan for. Stop the RAF and
                 // wait for the audio element's `play` event to restart
-                // via `onAudioPlay`. `{ once: true }` avoids listener
-                // accumulation if we bounce in/out of paused state.
+                // via `onAudioPlay`. The pending-listener guard prevents
+                // duplicate registrations if startWatch runs multiple
+                // times while audio remains paused (e.g., user enables
+                // Step Mode pre-playback, then seeks or changes
+                // arrangement — each path touches startWatch).
                 rafHandle = null;
-                audio.addEventListener('play', onAudioPlay, { once: true });
+                if (!audioPlayListenerPending) {
+                    audioPlayListenerPending = true;
+                    audio.addEventListener('play', onAudioPlay, { once: true });
+                }
                 return;
             }
             const t = audio.currentTime;
@@ -300,7 +307,9 @@
     function onAudioPlay() {
         // Audio resumed after a user-initiated pause (not a step-mode
         // PAUSED — that's handled by advance()/onArrangementChanged).
-        // Restart the watch if we're still supposed to be scanning.
+        // Clear the pending-listener guard regardless of whether we
+        // restart — the listener itself already fired exactly once.
+        audioPlayListenerPending = false;
         if (!enabled || state !== STATE_WATCHING) return;
         startWatch();
     }
@@ -409,6 +418,16 @@
         if (e.code !== 'Space') return;
         if (state !== STATE_PAUSED) return;
         if (!isPlayerActive()) return;
+        // Don't intercept Space if the user is typing in an editable
+        // control — they expect the space character, not an advance.
+        // Applies to a rename dialog, the search box, or any future
+        // contenteditable in the player.
+        const target = e.target;
+        if (target && (
+            target.tagName === 'INPUT' ||
+            target.tagName === 'TEXTAREA' ||
+            target.isContentEditable
+        )) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         advance();
@@ -554,18 +573,48 @@
         window.playSong = wrapper;
     }
 
+    // ── Late-load installers ────────────────────────────────────────────
+    // Same retry discipline as `installPlaySongHook` — if the audio
+    // element or `window.slopsmith` aren't ready at script evaluation
+    // time (unusual load order, plugin loaded before core finished
+    // wiring the DOM), retry a bounded number of times. Backward seeks
+    // break silently if `seeked` isn't attached, so this isn't
+    // purely theoretical.
+
+    let _seekedInstalled = false;
+    function installSeekedListener() {
+        if (_seekedInstalled) return;
+        const audioEl = getAudio();
+        if (audioEl) {
+            audioEl.addEventListener('seeked', onSeeked);
+            _seekedInstalled = true;
+            return;
+        }
+        if ((installSeekedListener._retries = (installSeekedListener._retries || 0) + 1) < 20) {
+            setTimeout(installSeekedListener, 50);
+        }
+    }
+
+    let _arrangementListenerInstalled = false;
+    function installArrangementListener() {
+        if (_arrangementListenerInstalled) return;
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            window.slopsmith.on('arrangement:changed', onArrangementChanged);
+            _arrangementListenerInstalled = true;
+            return;
+        }
+        if ((installArrangementListener._retries = (installArrangementListener._retries || 0) + 1) < 20) {
+            setTimeout(installArrangementListener, 50);
+        }
+    }
+
     // ── Bootstrap ───────────────────────────────────────────────────────
 
     window.addEventListener('notedetect:hit', onNoteDetectHit);
     document.addEventListener('keydown', onKeydownCapture, { capture: true });
 
-    const audioEl = getAudio();
-    if (audioEl) audioEl.addEventListener('seeked', onSeeked);
-
-    if (window.slopsmith && typeof window.slopsmith.on === 'function') {
-        window.slopsmith.on('arrangement:changed', onArrangementChanged);
-    }
-
+    installSeekedListener();
+    installArrangementListener();
     installPlaySongHook();
     ensureButton();
 })();
