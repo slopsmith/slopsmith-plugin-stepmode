@@ -17,6 +17,15 @@
 (function () {
     'use strict';
 
+    // Global idempotency guard — a second evaluation of this file (HMR,
+    // accidental double <script> tag) would otherwise register duplicate
+    // `notedetect:hit` / `keydown` / `seeked` / `arrangement:changed`
+    // listeners, and a single keypress or hit would advance step-mode
+    // twice. The flag lives on `window` because module scope resets on
+    // every evaluation; same pattern we landed in notedetect post-#17.
+    if (window.__stepModeInstalled) return;
+    window.__stepModeInstalled = true;
+
     // ── State machine ────────────────────────────────────────────────────
     // IDLE     — Step Mode toggled off; plugin is passive
     // WATCHING — toggled on, audio playing, RAF scanning for next note
@@ -30,7 +39,8 @@
     let rafHandle = null;
     let chartEvents = [];      // unified sorted list of {t, notes:[{s,f}]} (notes + chords)
     let chartCacheKey = null;  // invalidated when notes/chords count changes
-    let waitingFor = null;     // current event (when PAUSED)
+    let nextEventIdx = 0;      // cursor into chartEvents — the event we're watching for
+    let waitingFor = null;     // current event (when PAUSED). Always === chartEvents[nextEventIdx] while paused.
     let btn = null;            // toggle button element
     let hudEl = null;          // waiting overlay
 
@@ -69,6 +79,10 @@
         events.sort((a, b) => a.t - b.t);
         chartEvents = events;
         chartCacheKey = `${notes.length}-${chords.length}`;
+        // Reset the cursor — `findNextEvent` will scan forward from 0 on
+        // the next tick and land on the right place for the current
+        // audio.currentTime.
+        nextEventIdx = 0;
     }
 
     function rebuildIfChartChanged() {
@@ -82,14 +96,22 @@
     }
 
     function findNextEvent(t) {
-        // Binary search: first event with .t >= t.
-        let lo = 0, hi = chartEvents.length;
-        while (lo < hi) {
-            const mid = (lo + hi) >> 1;
-            if (chartEvents[mid].t < t) lo = mid + 1;
-            else hi = mid;
+        // Cursor-based forward scan. `nextEventIdx` points at the event
+        // we're currently watching for; `advance()` bumps it past the
+        // event we just cleared. Without this cursor, `findNextEvent`
+        // would return the SAME event on the next RAF tick after
+        // advance() (because `audio.currentTime` only moved a few
+        // milliseconds past the pause threshold), and `pauseOn` would
+        // re-trigger on the same event — an infinite loop where
+        // step-mode never progresses past the first note.
+        //
+        // On seek / rebuild / arrangement change, callers reset
+        // nextEventIdx to 0 and this scan advances it forward. Backward
+        // seeks are handled the same way — reset first, re-scan.
+        while (nextEventIdx < chartEvents.length && chartEvents[nextEventIdx].t < t) {
+            nextEventIdx++;
         }
-        return lo < chartEvents.length ? chartEvents[lo] : null;
+        return nextEventIdx < chartEvents.length ? chartEvents[nextEventIdx] : null;
     }
 
     // ── Pitch-name formatting for the HUD ────────────────────────────────
@@ -257,6 +279,14 @@
     function advance() {
         const audio = getAudio();
         if (!audio) return;
+        // Bump the cursor past the event we just advanced off, so the
+        // next RAF tick looks for the FOLLOWING event rather than
+        // re-pausing on this one. Invariant: at entry, waitingFor ===
+        // chartEvents[nextEventIdx] (because `pauseOn` only fires for
+        // events returned by `findNextEvent`).
+        if (waitingFor && chartEvents[nextEventIdx] === waitingFor) {
+            nextEventIdx++;
+        }
         state = STATE_WATCHING;
         waitingFor = null;
         hideWaitingHUD();
@@ -303,8 +333,9 @@
     function onSeeked() {
         if (!enabled) return;
         // User seeked — the event they were waiting for may now be in
-        // the past or irrelevant. Clear any wait, re-arm the watch from
-        // the new time.
+        // the past or irrelevant. Reset the cursor so the next tick
+        // lands on the correct next event for the new `audio.currentTime`.
+        nextEventIdx = 0;
         if (state === STATE_PAUSED) {
             hideWaitingHUD();
             waitingFor = null;
@@ -314,13 +345,18 @@
     }
 
     function onArrangementChanged() {
-        // Chart changed; re-scan. If we were paused on an event that
-        // no longer exists in the new arrangement's chart, drop it.
+        // Chart changed; re-scan (rebuildChartEvents resets the cursor).
+        // If we were paused on an event that no longer exists, we also
+        // need to resume the <audio> element — otherwise we'd leave
+        // playback paused with the HUD hidden and no way for the user
+        // to tell why audio stopped.
         rebuildChartEvents();
         if (state === STATE_PAUSED) {
             hideWaitingHUD();
             waitingFor = null;
             state = STATE_WATCHING;
+            const audio = getAudio();
+            if (audio) audio.play().catch(() => {});
         }
     }
 

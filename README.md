@@ -45,7 +45,7 @@ For v1, a chord counts as "played" if **any one** of its notes is detected as a 
 ## Technical notes
 
 - **Speed preservation.** The plugin pauses and resumes the shared `<audio>` element via `pause()` / `play()`. `HTMLAudioElement.playbackRate` survives pause/play, so your speed-slider setting (0.5×, 1×, etc.) is preserved automatically.
-- **A/V sync offset compatibility.** Step-mode watches `audio.currentTime` and references `highway.getTime()` for chart-time lookups. `getTime()` returns the audio-aligned clock (not the visual-calibrated render clock from `getAvOffset()`), so the plugin works correctly regardless of the user's A/V sync setting.
+- **Timing source.** Step-mode watches `audio.currentTime` directly for its chart-time comparisons and pause triggering. It doesn't call `highway.getTime()` — timing behaviour follows the shared `<audio>` element's playback clock, so speed-slider changes and any future A/V offset calibration apply consistently to what step-mode sees and what the user hears.
 - **Multiple instances / splitscreen.** Step-mode operates on the single shared `<audio>` element and the primary highway, so it's a player-level feature rather than a per-panel one. Splitscreen plugin compatibility is inherent — step-mode pauses the one audio element that drives all panels' render clocks.
 - **No telemetry.** Step-mode doesn't persist anything, doesn't dispatch its own events, and doesn't talk to the server. Entirely client-side, entirely ephemeral.
 
