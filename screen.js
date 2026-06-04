@@ -253,7 +253,7 @@
             return;
         }
         // v3: mount into the host's stable plugin-control slot (Plugins rail
-        // popover). The legacy `button:last-child` anchor resolves to a NESTED
+        // popover). The legacy DOM-injection anchor resolves to a NESTED
         // transport button in v3 and would throw on insertBefore; the slot is
         // always present in v3, so that anchor is only used in the classic UI.
         const isV3 = !!(window.slopsmith && window.slopsmith.uiVersion === 'v3');
@@ -268,7 +268,7 @@
         configureButton(btn);
         // Insert before the last-child (typically the Close button) so new
         // buttons stack consistently with notedetect's Detect + gear.
-        const closeBtn = isV3 ? null : controls.querySelector('button:last-child');
+        const closeBtn = isV3 ? null : controls.querySelector(':scope > button:last-of-type');
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
         updateButton();
