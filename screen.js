@@ -252,13 +252,23 @@
             updateButton();
             return;
         }
-        const controls = document.getElementById('player-controls');
+        // v3: mount into the host's stable plugin-control slot (Plugins rail
+        // popover). The legacy `button:last-child` anchor resolves to a NESTED
+        // transport button in v3 and would throw on insertBefore; the slot is
+        // always present in v3, so that anchor is only used in the classic UI.
+        const isV3 = !!(window.slopsmith && window.slopsmith.uiVersion === 'v3');
+        let slot = null;
+        if (isV3 && window.slopsmith.ui && typeof window.slopsmith.ui.playerControlSlot === 'function') {
+            try { const _s = window.slopsmith.ui.playerControlSlot(); if (_s instanceof Element) slot = _s; }
+            catch (_e) { /* host slot API failure → fall back to legacy container */ }
+        }
+        const controls = slot || document.getElementById('player-controls');
         if (!controls) return;
         btn = document.createElement('button');
         configureButton(btn);
         // Insert before the last-child (typically the Close button) so new
         // buttons stack consistently with notedetect's Detect + gear.
-        const closeBtn = controls.querySelector('button:last-child');
+        const closeBtn = isV3 ? null : controls.querySelector('button:last-child');
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
         updateButton();
