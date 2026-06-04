@@ -268,7 +268,7 @@
         configureButton(btn);
         // Insert before the last-child (typically the Close button) so new
         // buttons stack consistently with notedetect's Detect + gear.
-        const closeBtn = isV3 ? null : controls.querySelector('button:last-child');
+        const closeBtn = isV3 ? null : controls.querySelector(':scope > button:last-of-type');
         if (closeBtn) controls.insertBefore(btn, closeBtn);
         else controls.appendChild(btn);
         updateButton();
