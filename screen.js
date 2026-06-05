@@ -223,12 +223,17 @@
         if (hintEl) {
             // Play-to-advance is available whenever notedetect's verifier is
             // present — Step Mode auto-enables it, so we key the hint off the
-            // API existing rather than its momentary enabled state.
+            // API existing rather than its momentary enabled state. Three
+            // cases: verifier present; notedetect present but too old (needs
+            // update); notedetect absent (needs install).
             const nd = window.noteDetect;
-            const verifierAvailable = nd && typeof nd.setVerifyTarget === 'function';
-            hintEl.textContent = verifierAvailable
-                ? 'Play the note or press Space to skip'
-                : 'Press Space to advance (install Note Detection for play-to-advance)';
+            if (nd && typeof nd.setVerifyTarget === 'function') {
+                hintEl.textContent = 'Play the note or press Space to skip';
+            } else if (nd) {
+                hintEl.textContent = 'Press Space to advance (update Note Detection for play-to-advance)';
+            } else {
+                hintEl.textContent = 'Press Space to advance (install Note Detection for play-to-advance)';
+            }
         }
         hudEl.classList.remove('hidden');
     }
@@ -456,6 +461,13 @@
 
     function onNoteDetectHit(e) {
         if (!enabled || state !== STATE_PAUSED || !waitingFor) return;
+        // Legacy fallback ONLY. When notedetect exposes the timing-free
+        // verifier we advance on notedetect:verify instead — so ignore the
+        // timing-gated hit here. On a frozen playhead it fires early/for the
+        // wrong note (the very bug this fixes), and letting both paths run
+        // would race. Pre-verifier notedetect builds still use this path.
+        const nd = window.noteDetect;
+        if (nd && typeof nd.setVerifyTarget === 'function') return;
         const hit = e.detail;
         if (!hit || !hit.note) return;
         // Require a real timestamp — older/partial notedetect:hit
