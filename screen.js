@@ -7,10 +7,20 @@
 // Implements slopsmith#52.
 //
 // Interop:
-//   - Hit-based advance uses the `notedetect:hit` CustomEvent dispatched by
-//     slopsmith-plugin-notedetect (v1.1+). If notedetect isn't installed or
-//     enabled, Space is the only advance mechanism — the waiting HUD updates
-//     its hint text accordingly.
+//   - Play-to-advance uses notedetect's chart-aware VERIFIER, not its
+//     timing-gated hit. While paused, Step Mode registers the waited note via
+//     window.noteDetect.setVerifyTarget() and advances on the resulting
+//     `notedetect:verify` event. The verifier asks "is the expected (string,
+//     fret) ringing now?" against the live audio with NO playhead/timing gate
+//     — which is what notedetect:hit gets wrong here: Step Mode freezes the
+//     playhead ~50 ms before the note, so the hit is judged early and the note
+//     is retired as a one-shot miss, leaving the step stuck (#468 / #630).
+//   - Step Mode auto-enables notedetect while active (and restores its prior
+//     state on disable), so the user only has to turn on Step Mode. The
+//     initial enable runs inside the toggle click for getUserMedia's gesture.
+//   - `notedetect:hit` is still honoured as a legacy fallback. If notedetect
+//     isn't installed, Space is the only advance mechanism — the waiting HUD
+//     updates its hint text accordingly.
 //   - Speed slider is preserved across pauses: we pause/resume the <audio>
 //     element, and HTMLAudioElement keeps `playbackRate` across pause/play.
 
@@ -19,8 +29,8 @@
 
     // Global idempotency guard — a second evaluation of this file (HMR,
     // accidental double <script> tag) would otherwise register duplicate
-    // `notedetect:hit` / `keydown` / `seeked` / `arrangement:changed`
-    // listeners, and a single keypress or hit would advance step-mode
+    // `notedetect:verify` / `notedetect:hit` / `keydown` / `seeked` /
+    // `arrangement:changed` listeners, and a single keypress or hit would advance step-mode
     // twice. The flag lives on `window` because module scope resets on
     // every evaluation; same pattern we landed in notedetect post-#17.
     if (window.__stepModeInstalled) return;
@@ -41,6 +51,9 @@
     let chartCacheKey = null;  // invalidated when notes/chords count changes
     let nextEventIdx = 0;      // cursor into chartEvents — the event we're watching for
     let waitingFor = null;     // current event (when PAUSED). Always === chartEvents[nextEventIdx] while paused.
+    let _advancing = false;    // re-entrancy guard while a resume (audio.play) is in flight
+    let _advanceGen = 0;       // bumped on every pause-state transition; stale audio.play() callbacks compare against it and bail
+    let _ndReqGen = 0;         // bumped on every Step Mode enable/disable; a pending nd.enable() only claims ownership if still current
     let btn = null;            // toggle button element
     let hudEl = null;          // waiting overlay
     let audioPlayListenerPending = false; // guard against duplicate one-shot `play` listeners
@@ -208,11 +221,14 @@
             }
         }
         if (hintEl) {
+            // Play-to-advance is available whenever notedetect's verifier is
+            // present — Step Mode auto-enables it, so we key the hint off the
+            // API existing rather than its momentary enabled state.
             const nd = window.noteDetect;
-            const ndActive = nd && typeof nd.isEnabled === 'function' && nd.isEnabled();
-            hintEl.textContent = ndActive
+            const verifierAvailable = nd && typeof nd.setVerifyTarget === 'function';
+            hintEl.textContent = verifierAvailable
                 ? 'Play the note or press Space to skip'
-                : 'Press Space to advance (enable Note Detection for hit-based advance)';
+                : 'Press Space to advance (install Note Detection for play-to-advance)';
         }
         hudEl.classList.remove('hidden');
     }
@@ -339,13 +355,29 @@
 
     // ── State transitions ────────────────────────────────────────────────
 
+    // Abandon the current pause/resume epoch: bump the generation so any
+    // in-flight advance() audio.play() callback bails, AND clear _advancing so
+    // a fresh pause isn't left permanently unadvanceable by the stale resume's
+    // not-yet-cleared guard. Call this BEFORE any early return on a path that
+    // leaves/abandons PAUSED.
+    function _abandonResume() {
+        _advanceGen++;
+        _advancing = false;
+    }
+
     function pauseOn(event) {
         const audio = getAudio();
         if (!audio) return;
         audio.pause();
+        _abandonResume();   // new pause epoch — invalidates any in-flight advance() resume
         state = STATE_PAUSED;
         waitingFor = event;
         showWaitingHUD(event);
+        // Register this note with notedetect's verifier so a played note
+        // advances the step. ensureNoteDetect covers notedetect having been
+        // toggled off between songs.
+        ensureNoteDetect();
+        setVerifyTarget(event.notes);
         // Stop the RAF while paused — PAUSED can last indefinitely
         // (user thinking, walking away, etc.) and we don't want to
         // spin the main thread at 60 Hz just to early-return. advance()
@@ -358,8 +390,23 @@
         const audio = getAudio();
         const waitedEvent = waitingFor;
         if (!audio || !waitedEvent) return;
+        // Re-entrancy guard: audio.play() resolves async, so the state stays
+        // PAUSED until completeAdvance runs. notedetect:verify fires every
+        // frame the note rings, so without this guard a second verify (or a
+        // verify racing a Space press) would call advance() again mid-resume
+        // and bump nextEventIdx twice — skipping the next note. Cleared in
+        // completeAdvance and on a rejected resume.
+        if (_advancing) return;
+        _advancing = true;
+        // Snapshot the pause epoch. If a seek / disable / arrangement-change
+        // abandons this pause before audio.play() settles, _advanceGen moves
+        // on and the stale callbacks below must NOT resurrect WATCHING state,
+        // bump the cursor, or re-show the HUD for an abandoned note.
+        const myGen = _advanceGen;
 
         function completeAdvance() {
+            _advancing = false;
+            if (!enabled || myGen !== _advanceGen) return;
             // Bump the cursor past the event we just advanced off, so the
             // next RAF tick looks for the FOLLOWING event rather than
             // re-pausing on this one. Invariant: at entry, waitingFor
@@ -370,6 +417,8 @@
             }
             state = STATE_WATCHING;
             waitingFor = null;
+            // Leaving PAUSED — stop the verifier scoring this (now past) note.
+            clearVerifyTarget();
             hideWaitingHUD();
             // Restart the RAF — pauseOn cancelled it when we entered
             // PAUSED, and we need it running again to watch for the
@@ -388,6 +437,10 @@
         const playResult = audio.play();
         if (playResult && typeof playResult.then === 'function') {
             playResult.then(completeAdvance).catch(() => {
+                _advancing = false;
+                // Same staleness guard as completeAdvance: don't re-pause on a
+                // note that a seek/disable/arrangement-change has moved past.
+                if (!enabled || myGen !== _advanceGen) return;
                 state = STATE_PAUSED;
                 waitingFor = waitedEvent;
                 showWaitingHUD(waitedEvent);
@@ -424,6 +477,80 @@
         if (match && timeOK) advance();
     }
 
+    // ── notedetect verifier integration ──────────────────────────────────
+    // The reliable advance path. We register the waited note as a verify
+    // target; notedetect scores it against the live audio every frame
+    // (timing-free) and fires notedetect:verify on a hit. See the header note
+    // for why the timing-gated notedetect:hit can't work on a frozen playhead.
+
+    let _weEnabledNoteDetect = false;   // did WE turn notedetect on?
+
+    function setVerifyTarget(notes) {
+        const nd = window.noteDetect;
+        if (nd && typeof nd.setVerifyTarget === 'function') {
+            try { nd.setVerifyTarget(notes); } catch (e) { /* best-effort */ }
+        }
+    }
+
+    function clearVerifyTarget() { setVerifyTarget(null); }
+
+    // Make sure notedetect is capturing so the verifier can run. No-op if it's
+    // absent or already on. Called from enable() (inside the toggle gesture,
+    // so getUserMedia is allowed) and defensively from pauseOn() in case
+    // notedetect was toggled off between songs — by then mic permission is
+    // already granted, so re-enabling won't re-prompt.
+    function ensureNoteDetect() {
+        const nd = window.noteDetect;
+        if (!nd || typeof nd.enable !== 'function') return;
+        if (typeof nd.isEnabled === 'function' && nd.isEnabled()) return;
+        const myReq = _ndReqGen;
+        let p;
+        try { p = nd.enable(); } catch (e) { return; /* mic denied, etc. */ }
+        // enable() awaits getUserMedia, so resolve the ownership claim only
+        // once it has actually turned on. If Step Mode was turned off (or
+        // re-toggled) while enable() was in flight, _ndReqGen has moved on:
+        // don't claim ownership, and undo the now-unwanted enable (unless the
+        // user has opted into Detect themselves) so we don't leave the mic on
+        // past disable.
+        Promise.resolve(p)
+            .then(() => {
+                const on = typeof nd.isEnabled === 'function' ? nd.isEnabled() : false;
+                if (!on) return;
+                // Only claim ownership if this request is still current. Do NOT
+                // disable on a stale callback: note_detect.enable() dedupes
+                // concurrent callers onto ONE shared in-flight promise, so
+                // disabling here could tear down a newer Step Mode session —
+                // or a manual Detect click — that joined the same promise.
+                // Leaving Detect on after a rapid disable-during-spinup is
+                // benign (user-toggleable); clobbering a live session is not.
+                if (enabled && _ndReqGen === myReq) {
+                    _weEnabledNoteDetect = true;
+                }
+            })
+            .catch(() => { /* enable rejected — leave ownership unclaimed */ });
+    }
+
+    function restoreNoteDetect() {
+        if (!_weEnabledNoteDetect) return;
+        _weEnabledNoteDetect = false;
+        const nd = window.noteDetect;
+        if (!nd || typeof nd.disable !== 'function') return;
+        // Don't turn Detect off if the user has since opted into it themselves.
+        if (typeof nd.wantsDetect === 'function' && nd.wantsDetect()) return;
+        // silent: suppress notedetect's end-of-session summary modal — Step
+        // Mode toggling off shouldn't pop a scoring summary.
+        try { nd.disable({ silent: true }); } catch (e) { /* best-effort */ }
+    }
+
+    function onNoteDetectVerify(e) {
+        if (!enabled || state !== STATE_PAUSED || !waitingFor) return;
+        if (!e || !e.detail || !e.detail.isHit) return;
+        // The target was set to waitingFor.notes at pauseOn and cleared on
+        // every transition out of PAUSED, so a live verify hit is by
+        // construction for the note we're waiting on.
+        advance();
+    }
+
     function onKeydownCapture(e) {
         // Capture-phase listener so we run BEFORE core's bubble-phase
         // keydown handler at static/app.js:1059. When we're in PAUSED
@@ -451,6 +578,8 @@
 
     function onSeeked() {
         if (!enabled) return;
+        // Abandon any in-flight advance() resume tied to the pre-seek pause.
+        _abandonResume();
         // User seeked — the event they were waiting for may now be in
         // the past or irrelevant. Jump the cursor directly to the new
         // audio.currentTime via binary search rather than linear-scan
@@ -459,6 +588,7 @@
         if (state === STATE_PAUSED) {
             hideWaitingHUD();
             waitingFor = null;
+            clearVerifyTarget();
         }
         state = STATE_WATCHING;
         startWatch();
@@ -491,16 +621,27 @@
         //      valid current target.
         rebuildChartEvents();
         if (state !== STATE_PAUSED) return;
+        // Abandon any in-flight advance() resume tied to the old-chart pause
+        // (before the getAudio guard, so even the no-audio early return below
+        // still invalidates it), then snapshot the new epoch so THIS resume's
+        // callbacks also bail if a later transition supersedes them.
+        _abandonResume();
+        const myGen = _advanceGen;
         const audio = getAudio();
         if (!audio) return;
         waitingFor = null;
+        // Drop the stale target; pauseOn() below re-registers for the new
+        // chart's note if we end up re-pausing.
+        clearVerifyTarget();
         hideWaitingHUD();
         const playResult = audio.play();
         if (playResult && typeof playResult.then === 'function') {
             playResult.then(() => {
+                if (!enabled || myGen !== _advanceGen) return;
                 state = STATE_WATCHING;
                 startWatch();
             }).catch(() => {
+                if (!enabled || myGen !== _advanceGen) return;
                 const t = audio.currentTime;
                 const nextEvent = findNextEvent(t);
                 if (nextEvent) {
@@ -525,16 +666,24 @@
 
     function enable() {
         enabled = true;
+        _ndReqGen++;   // fresh note-detect request epoch for this Step Mode session
         ensureHUD();
         ensureButton();
         rebuildChartEvents();
         startWatch();
+        // Turn on notedetect so the verifier is live for play-to-advance.
+        // Runs inside the toggle-button click, so getUserMedia has its
+        // gesture. No-op if notedetect is absent (Space-only) or already on.
+        ensureNoteDetect();
         updateButton();
     }
 
     function disable() {
         enabled = false;
+        _ndReqGen++;       // invalidate any in-flight nd.enable() ownership claim
+        _abandonResume();  // invalidate any in-flight advance() resume
         stopWatch();
+        clearVerifyTarget();
         if (state === STATE_PAUSED) {
             // Release any pause we caused so audio resumes.
             const audio = getAudio();
@@ -543,6 +692,8 @@
         state = STATE_IDLE;
         waitingFor = null;
         hideWaitingHUD();
+        // Restore notedetect to the state we found it in.
+        restoreNoteDetect();
         updateButton();
     }
 
@@ -628,6 +779,7 @@
 
     // ── Bootstrap ───────────────────────────────────────────────────────
 
+    window.addEventListener('notedetect:verify', onNoteDetectVerify);
     window.addEventListener('notedetect:hit', onNoteDetectHit);
     document.addEventListener('keydown', onKeydownCapture, { capture: true });
 
